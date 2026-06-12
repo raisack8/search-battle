@@ -1,0 +1,12 @@
+{
+  "functions": {
+    "app/api/browser/route.ts": {
+      "memory": 3008,
+      "maxDuration": 60
+    },
+    "app/api/submit/route.ts": {
+      "memory": 1024,
+      "maxDuration": 60
+    }
+  }
+}

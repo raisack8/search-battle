@@ -84,12 +84,66 @@
 | DB | Supabase (Postgres) + Drizzle ORM | お題・スコア・ユーザー。Realtime/Auth/Storage が揃っており追々機能と相性が良い |
 | OCR | Google Cloud Vision API（推奨）/ Tesseract.js（無料代替） | 日本語精度は Cloud Vision が圧倒的。月1,000件まで無料 |
 | 類似率 | 文字列正規化 + レーベンシュタイン / trigram。数値お題は相対誤差 | 後述 |
-| 認証 | Supabase Auth | 追々機能（投稿・対戦）で必須。MVP では匿名セッションでも可 |
+| 認証 | Supabase Auth | 後述。DB・Realtime と同じ Supabase に統一するのが最適解 |
+| Bot 対策 | Cloudflare Turnstile | ヘッドレスブラウザ API の乱用防止。無料・CAPTCHA レス |
 | リアルタイム対戦 | Supabase Realtime | Vercel Functions は WebSocket 常時接続不可のため外部 Realtime が必須 |
 
 ## コア機能のロジック
 
-### 0. DB 方針（KVS は不要）
+### 0. 認証基盤：Supabase Auth を採用
+
+**推奨は Supabase Auth。**
+
+候補を比較：
+
+| | Supabase Auth | Clerk | NextAuth.js (Auth.js) |
+|---|---|---|---|
+| 追加コスト | 無料（Supabase に内包） | 無料枠あり、MAU 課金 | 無料（OSS） |
+| Next.js との相性 | 良好（公式 SSR ヘルパーあり） | 最高（専用コンポーネント付き） | 良好 |
+| 匿名認証 | ネイティブ対応 | 非対応 | 非対応 |
+| Supabase RLS との連携 | 直結（JWT の `sub` が RLS の `auth.uid()`） | JWTカスタム設定が必要 | 同上 |
+| OAuth（Google等） | 対応 | 対応 | 対応 |
+| 独自UIの必要性 | 必要（シンプルなフォームでよい） | 不要（Clerk UIが完成品） | 必要 |
+
+**Supabase Auth を選ぶ理由：**
+
+1. **匿名認証が使える** — MVP では「サインアップ不要でそのままプレイ」→「スコアを残したい場合に後からアカウント紐付け」という UX が作れる。Clerk は匿名非対応
+2. **Supabase RLS と直結** — DB の Row Level Security が `auth.uid()` を直接参照できる。他の認証基盤だとJWTのカスタム設定が要る
+3. **スタックの追加なし** — DB・Realtime・Storage・Auth が全部 Supabase。Clerk を足すと認証だけ別サービスになり、トークンの橋渡しが面倒
+4. **コスト** — Supabase Free で MAU 5万まで。Clerk の無料枠は MAU 1万
+
+Clerk を選ぶ理由があるとしたら「認証UIを1行も書きたくない」場合のみ。このアプリ規模では Supabase Auth で十分。
+
+### 0b. Bot 対策：Cloudflare Turnstile
+
+ヘッドレスブラウザ API（`/api/browser`）は1リクエストあたりサーバーコストが高いため、乱用防止が必要。
+
+**Turnstile の組み込み方：**
+
+```
+[ゲーム開始時に1回だけ検証]
+        │
+        ▼
+クライアント: <Turnstile sitekey="..." onSuccess={token => ...} />
+        │  token をゲーム開始リクエストに含める
+        ▼
+サーバー (POST /api/session/start):
+  fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    body: { secret, response: token, remoteip }
+  })
+  → success なら sessionToken（署名付きJWT）を発行
+        │
+        ▼
+以降の /api/browser, /api/submit リクエストは sessionToken を検証
+```
+
+ポイント：
+- **Turnstile はゲーム開始時の1回だけ** 。毎操作で検証するとラグが増える
+- 発行する `sessionToken` に `{ userId, quizId, exp: +90秒 }` を入れておく → ブラウザ操作ごとに有効期限を延長。セッション切れたらまた Turnstile
+- Turnstile は**完全無料**、月間リクエスト制限なし
+- スマホでも表示される（CAPTCHA 画像のクリック等は発生しない非対話型）
+
+### 0c. DB 方針（KVS は不要）
 
 **PostgreSQL（Supabase）一本で十分、KVS は不要。**
 

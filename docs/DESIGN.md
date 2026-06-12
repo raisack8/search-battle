@@ -76,43 +76,73 @@
 
 ### 技術スタック
 
+**方針：Vercel ネイティブで完結させる**
+
 | レイヤ | 採用 | 理由 |
 |---|---|---|
-| フレームワーク | Next.js 15 (App Router) + TypeScript | 要件指定。API Routes でサーバー処理も完結 |
+| フレームワーク | Next.js 15 (App Router) + TypeScript | 要件指定 |
 | ホスティング | Vercel | 要件指定 |
-| ヘッドレスブラウザ | `puppeteer-core` + `@sparticuz/chromium` | Vercel Function 上で動く軽量 Chromium。実績多数 |
-| DB | Supabase (Postgres) + Drizzle ORM | お題・スコア・ユーザー。Realtime/Auth/Storage が揃っており追々機能と相性が良い |
-| OCR | Google Cloud Vision API（推奨）/ Tesseract.js（無料代替） | 日本語精度は Cloud Vision が圧倒的。月1,000件まで無料 |
-| 類似率 | 文字列正規化 + レーベンシュタイン / trigram。数値お題は相対誤差 | 後述 |
-| 認証 | Supabase Auth | 後述。DB・Realtime と同じ Supabase に統一するのが最適解 |
-| Bot 対策 | Cloudflare Turnstile | ヘッドレスブラウザ API の乱用防止。無料・CAPTCHA レス |
-| リアルタイム対戦 | Supabase Realtime | Vercel Functions は WebSocket 常時接続不可のため外部 Realtime が必須 |
+| ヘッドレスブラウザ | `puppeteer-core` + `@sparticuz/chromium` | Vercel Function 上で動く軽量 Chromium |
+| DB | **Vercel Postgres (Neon)** + Drizzle ORM | Vercel ダッシュボードで完結。サーバーレス Postgres、接続プール内蔵 |
+| ストレージ | **Vercel Blob** | スクショ画像・お題画像。Vercel 管理で完結 |
+| 認証 | **Auth.js v5 (NextAuth)** + Vercel Postgres | Next.js 公式の認証ライブラリ。DBセッション管理も Vercel Postgres に同居 |
+| OCR | Google Cloud Vision API / Tesseract.js | 日本語精度は Cloud Vision が圧倒的。月1,000件まで無料 |
+| 類似率 | 文字列正規化 + レーベンシュタイン / trigram。数値は相対誤差 | 後述 |
+| Bot 対策 | Cloudflare Turnstile | ヘッドレスブラウザ API の乱用防止。無料・非対話型 |
+| リアルタイム対戦（追々） | **Pusher / Ably** | Vercel は WebSocket 常時接続不可。外部 Realtime が必要（後述） |
+
+### Vercel ネイティブ vs Supabase の比較
+
+| 観点 | Vercel ネイティブ（採用） | Supabase |
+|---|---|---|
+| 管理画面 | Vercel 1か所で完結 | Vercel + Supabase の2か所 |
+| 請求 | Vercel 1本 | Vercel + Supabase 別々 |
+| DB | Vercel Postgres (Neon) — サーバーレスで Vercel 最適化 | Supabase Postgres — 常時起動、リージョンが限られる |
+| ストレージ | Vercel Blob — S3互換、CDN付き | Supabase Storage — 機能は十分だが別サービス |
+| 認証 | Auth.js — OSS、柔軟性高い | Supabase Auth — RLS直結が強みだが設定が複雑 |
+| Row Level Security | なし（API層で制御） | あり（DB層で制御） |
+| リアルタイム | なし（別途 Pusher 等が必要） | Supabase Realtime あり |
+| 匿名認証 | Auth.js でゲストセッション実装可 | ネイティブ対応 |
+
+**このアプリで Vercel ネイティブが問題ない理由：**
+
+1. **RLS がなくても困らない** — セキュリティはすでに API 層で担保している（screenshotId 検証・Turnstile）。RLS はあれば便利だが必須ではない
+2. **Realtime は追々機能** — MVP（1人プレイ）では不要。対戦機能を実装するときに Pusher 等を追加すればよい
+3. **匿名認証も Auth.js で作れる** — DB に `guest_` プレフィックスのセッションを作るだけ。ネイティブほど楽ではないが数十行で実装可能
+
+**Supabase を選んだほうがよいケース：**
+- 対戦機能を早期に実装したい（Realtime が即使える）
+- RLS で複雑なマルチユーザーのデータ分離を管理したい
+- 追加サービスの契約を気にしない
 
 ## コア機能のロジック
 
-### 0. 認証基盤：Supabase Auth を採用
+### 0. 認証基盤：Auth.js v5 (NextAuth) を採用
 
-**推奨は Supabase Auth。**
+**Vercel ネイティブ構成なら Auth.js 一択。**
 
-候補を比較：
+```ts
+// auth.ts — Auth.js の設定例
+import NextAuth from 'next-auth'
+import Google from 'next-auth/providers/google'
+import { DrizzleAdapter } from '@auth/drizzle-adapter'
+import { db } from '@/db'
 
-| | Supabase Auth | Clerk | NextAuth.js (Auth.js) |
-|---|---|---|---|
-| 追加コスト | 無料（Supabase に内包） | 無料枠あり、MAU 課金 | 無料（OSS） |
-| Next.js との相性 | 良好（公式 SSR ヘルパーあり） | 最高（専用コンポーネント付き） | 良好 |
-| 匿名認証 | ネイティブ対応 | 非対応 | 非対応 |
-| Supabase RLS との連携 | 直結（JWT の `sub` が RLS の `auth.uid()`） | JWTカスタム設定が必要 | 同上 |
-| OAuth（Google等） | 対応 | 対応 | 対応 |
-| 独自UIの必要性 | 必要（シンプルなフォームでよい） | 不要（Clerk UIが完成品） | 必要 |
+export const { handlers, signIn, signOut, auth } = NextAuth({
+  adapter: DrizzleAdapter(db),   // セッションを Vercel Postgres に保存
+  providers: [Google],
+  callbacks: {
+    session({ session, user }) {
+      session.user.id = user.id  // API ルートで user.id を使えるように
+      return session
+    },
+  },
+})
+```
 
-**Supabase Auth を選ぶ理由：**
-
-1. **匿名認証が使える** — MVP では「サインアップ不要でそのままプレイ」→「スコアを残したい場合に後からアカウント紐付け」という UX が作れる。Clerk は匿名非対応
-2. **Supabase RLS と直結** — DB の Row Level Security が `auth.uid()` を直接参照できる。他の認証基盤だとJWTのカスタム設定が要る
-3. **スタックの追加なし** — DB・Realtime・Storage・Auth が全部 Supabase。Clerk を足すと認証だけ別サービスになり、トークンの橋渡しが面倒
-4. **コスト** — Supabase Free で MAU 5万まで。Clerk の無料枠は MAU 1万
-
-Clerk を選ぶ理由があるとしたら「認証UIを1行も書きたくない」場合のみ。このアプリ規模では Supabase Auth で十分。
+- OAuth（Google / GitHub / Apple 等）は設定するだけで動く
+- セッション情報は Vercel Postgres に同居するため、追加サービス不要
+- **ゲスト（匿名）プレイ** は Auth.js のセッションとは別に `guestId` を cookie に持つ形で実装する（数十行）。プレイ後にサインインしたら game_sessions の `user_id` を更新して引き継ぎ
 
 ### 0b. Bot 対策：Cloudflare Turnstile
 

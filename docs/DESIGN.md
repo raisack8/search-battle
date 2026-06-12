@@ -89,6 +89,18 @@
 
 ## コア機能のロジック
 
+### 0. DB 方針（KVS は不要）
+
+**PostgreSQL（Supabase）一本で十分、KVS は不要。**
+
+KVS（Redis 等）が必要になるのは「高頻度アクセスのキャッシュ」「TTL 付きの一時セッション」が必要な場合。このアプリでは：
+
+- ブラウザセッション状態（currentUrl + scrollY）は軽量なので Postgres の `game_sessions` 行 or クライアントの state に持てば十分
+- リアルタイム対戦の同期は Supabase Realtime（Postgres の論理レプリケーションベース）が担う
+- スコアや履歴は Postgres でそのまま集計できる
+
+KVS を追加すると運用コストと複雑さが上がるだけ。スケールが大きくなったら後から Redis を足せばよく、MVP では不要。
+
 ### 1. お題を出す
 
 ```sql
@@ -106,14 +118,16 @@ created_by, likes_count, created_at
   - **`number`（高さは？）** → 数値抽出 + 相対誤差で採点
 - 画像は Supabase Storage に置き、出題APIはランダム or 日替わりで1問返す
 
-### 2. アプリ内ブラウザ + スクショ
+### 2. アプリ内ブラウザ + スクショ（矩形選択）
+
+#### ブラウザ操作 API
 
 `POST /api/browser` のリクエスト/レスポンス：
 
 ```ts
 // リクエスト
 { sessionId, action: 'navigate'|'search'|'click'|'scroll',
-  url?, query?, x?, y?, deltaY? , currentUrl?, scrollY? }
+  url?, query?, x?, y?, deltaY?, currentUrl?, scrollY? }
 
 // レスポンス
 { screenshotUrl,        // 撮影画像（Supabase Storage に保存し署名URL返却）
@@ -130,15 +144,42 @@ created_by, likes_count, created_at
 4. `scroll`: `window.scrollBy` 後に撮影
 5. スクショを Storage に保存し、`screenshotId` と `pageText` を DB に記録
 
-**チート対策の要**：採点 API はクライアントから画像を受け取らない。`screenshotId` だけを受け取り、サーバーに保存済みの画像を採点する。これで端末スクショ・画像アップロード・画像差し替えは全て無効。
+**チート対策の要**：採点 API はクライアントから画像を受け取らない。`screenshotId` だけを受け取り、サーバーに保存済みの画像を採点する。OS のスクショ機能（Windows の Win+Shift+S 等）を使っても、アップロードする口がないため使えない。端末スクショ・画像差し替えは構造的に無効。
+
+#### 矩形選択→エリア確定 UI
+
+「証拠にしたい場所を自分で指定する」UX。「スクショ確定」ボタンを押すと以下のフローになる：
+
+```
+[📸 証拠を選ぶ] ボタン押下
+        │
+        ▼
+現在のページ画像の上にオーバーレイ表示
+ ┌─────────────────────────┐
+ │  ページ画像（暗転）      │
+ │   ┌────────────┐        │
+ │   │            │← 明るい矩形 (ドラッグで移動・リサイズ)
+ │   │  選択エリア │
+ │   └────────────┘        │
+ │           [OK] [キャンセル]│
+ └─────────────────────────┘
+        │ OK を押す
+        ▼
+ 選択範囲の座標（x, y, w, h の % 値）をサーバーへ送信
+ → サーバーが screenshotId の画像をその座標でクロップ
+ → クロップ画像を cropId として DB 保存 → OCR へ
+```
+
+UI 実装：canvas または CSS+pointer events で矩形ドラッグ選択。スマホではタッチ操作でドラッグ。**ネイティブの選択ツールは一切使わない。**
 
 ### 3. スクショ OCR
 
-`POST /api/submit` で `{ sessionId, quizId, screenshotId }` を受け取り：
+`POST /api/submit` で `{ sessionId, quizId, screenshotId, cropRect: {x,y,w,h} }` を受け取り：
 
-1. Storage から該当スクショを取得
-2. Cloud Vision API `DOCUMENT_TEXT_DETECTION` で全文 OCR（日本語対応）
-3. （任意の検証）OCR テキストと保存済み `pageText` の重なりを確認 — 大きく乖離していたら不正フラグ
+1. Storage から `screenshotId` の画像を取得
+2. `cropRect` の座標でサーバー側クロップ（`sharp` ライブラリ等）
+3. クロップ画像に対して Cloud Vision API `DOCUMENT_TEXT_DETECTION` で OCR（日本語対応）
+4. （任意の検証）OCR テキストと保存済み `pageText` の重なりを確認 — 大きく乖離していたら不正フラグ
 
 > コスト最優先なら Tesseract.js をサーバー側で実行（無料・日本語精度は中程度）。
 > 将来的には LLM Vision（Claude 等）に「この画像から答えに該当する記述を抜き出せ」と投げる方式が最も賢く、OCR + 抽出 + 表記ゆれ吸収を一発でやれる。MVP は Cloud Vision で十分。
@@ -172,7 +213,38 @@ created_by, likes_count, created_at
 
 - 回答時間ボーナス：`残り時間/制限時間 × 20pt` を加算（対戦時の差別化要素）
 
-### 5. 追々：リアルタイム 1vs1 対戦
+### 5. DB に保存する採点結果
+
+```sql
+-- game_sessions テーブル
+id               uuid PK
+quiz_id          uuid FK → quizzes
+user_id          uuid FK → users (nullable: 匿名プレイ可)
+match_id         uuid FK → matches (nullable: ソロプレイ時は null)
+
+-- タイミング
+started_at       timestamptz   -- お題画面を開いた時刻
+answered_at      timestamptz   -- 「OK」を押した時刻
+time_to_answer   int           -- answered_at - started_at (秒)。クライアント送信値はサーバー側で上書き計算
+
+-- 採点結果
+screenshot_id    uuid FK → screenshots
+crop_rect        jsonb         -- { x, y, w, h } (% 値)
+ocr_text         text          -- OCR で得たテキスト
+similarity       numeric(5,4)  -- 0.0000 〜 1.0000
+is_correct       boolean       -- similarity >= 0.85
+base_score       int           -- 類似率ベースのスコア (0〜100)
+time_bonus       int           -- 時間ボーナス (0〜20)
+total_score      int           -- base_score + time_bonus
+
+created_at       timestamptz DEFAULT now()
+```
+
+`time_to_answer` は必ずサーバーが `answered_at - started_at` で算出する（クライアント値を信用しない）。
+
+`started_at` は `/api/quiz` でお題を返すときにサーバーが `game_sessions` 行を INSERT して記録。`answered_at` は `/api/submit` 受信時に UPDATE で記録。
+
+### 6. 追々：リアルタイム 1vs1 対戦
 
 Vercel の Function は WebSocket の常時接続を張れないため、**Supabase Realtime**（または Pusher/Ably）を使う。
 
@@ -185,7 +257,7 @@ match_events: マッチ進行イベント（参加・スクショ確定・採点
 - 進行同期：両クライアントが `match:{id}` チャンネルを subscribe。相手の「調査中…」「スクショ確定！」をリアルタイム表示
 - 採点はサーバー（`/api/submit`）が単一の真実。Realtime は表示同期のみに使い、スコア改竄余地を残さない
 
-### 6. 追々：ユーザーお題投稿（いいね付き）
+### 7. 追々：ユーザーお題投稿（いいね付き）
 
 - `quizzes.created_by` + `likes (user_id, quiz_id)` テーブル。`likes_count` は非正規化カウンタ
 - 投稿フォーム：問題文・画像アップロード（Supabase Storage）・正解・別解・タイプ
@@ -201,12 +273,18 @@ match_events: マッチ進行イベント（参加・スクショ確定・採点
                        [リモートブラウザ画面]
                         ├ 検索バー（Bing検索 or URL直打ち）
                         ├ ページ画像（タップでリンク遷移、ボタンでスクロール）
-                        └ 📸「これを証拠にする」ボタン
-                          │ screenshotId 確定
+                        └ 📸「証拠を選ぶ」ボタン
+                          │
+                          ▼
+                       [矩形選択オーバーレイ]
+                        ├ ページ画像暗転 + ドラッグで選択範囲を指定
+                        └ [OK] → cropRect をサーバーへ送信
+                          │ (screenshotId + cropRect) 確定
                           ▼
                        [結果画面]
+                        ├ 選択したクロップ画像を表示
                         ├ OCR で見つかった答え候補のハイライト
-                        ├ 類似率 ○○% → 獲得 ○○pt
+                        ├ 類似率 ○○%・回答時間 ○○秒 → 獲得 ○○pt
                         └ もう一回 / シェア
 ```
 
